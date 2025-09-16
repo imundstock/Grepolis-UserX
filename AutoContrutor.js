@@ -32,7 +32,7 @@
     { stoner: 2, ironer: 2 },
     { lumber: 3, stoner: 3, ironer: 3, temple: 3 },
     { storage: 5, main: 5, farm: 6 },
-    { market: 5 },
+    { market: 5, barracks: 5 },
     { stoner: 7, lumber: 7, ironer: 7 },
     { academy: 7 },
     { main: 14, barracks: 5, farm: 11, storage: 13, academy: 13 },
