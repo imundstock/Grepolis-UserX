@@ -1,12 +1,3 @@
-// ==UserScript==
-// @name         Constructor Gold (fixed)
-// @description  Grepolis Builder com inicialização tardia e tempos corrigidos (ciclo a cada 5s)
-// @namespace    https://grepolis.com
-// @version      1.3
-// @author       Hannzo
-// @match        https://*br79.grepolis.com/game/*
-// ==/UserScript==
-
 (() => {
   'use strict';
 
@@ -24,8 +15,7 @@
   const MIN_BUILD_DELAY_MS = 300;
   const MAX_BUILD_DELAY_MS = 800;
 
-  // ========= ORDEM DE CONSTRUÇÃO (igual à imagem) =========
-  // Cada objeto é uma etapa; o script tenta cumprir os níveis-alvo por etapa.
+  // ========= ORDEM DE CONSTRUÇÃO =========
   const instructions = [
     { lumber: 1, stoner: 1, ironer: 1, temple: 1, farm: 2 },
     { lumber: 2, storage: 2, main: 2, farm: 3, barracks: 1 },
@@ -34,12 +24,12 @@
     { storage: 5, main: 5 },
     { market: 5 },
     { stoner: 7, lumber: 7, ironer: 7 },
-    { academy: 7},
+    { academy: 7 },
     { main: 14, barracks: 5, farm: 11, storage: 13, academy: 13 },
     { stoner: 10, lumber: 15, ironer: 10 },
     { docks: 10 },
   ];
-  // =========================================================
+  // ======================================
 
   // ------------------ Utils ------------------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -47,7 +37,8 @@
 
   async function waitFor(predicate, { timeout = 60000, interval = 200 } = {}) {
     const t0 = Date.now();
-    while (true) { // eslint-disable-line no-constant-condition
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
       try { if (predicate()) return; } catch {}
       if (Date.now() - t0 > timeout) throw new Error('waitFor timeout');
       await sleep(interval);
@@ -169,8 +160,33 @@
     });
   }
 
+  // ------------------ Finalizar Construções Grátis ------------------
+  function clickFreeFinishersInDOM() {
+    // Itens da fila: tenta finalizar qualquer item com botão "grátis" visível e <= 5min
+    const queueItems = document.querySelectorAll('.js-queue-item');
+    queueItems.forEach(item => {
+      const countdownEl = item.querySelector('.countdown');
+      const freeButton = item.querySelector('.btn_time_reduction.type_free');
+      if (!countdownEl || !freeButton) return;
+
+      const txt = countdownEl.textContent.trim();
+      // formatos comuns: "MM:SS" ou "HH:MM:SS"
+      const parts = txt.split(':').map(Number);
+      let totalSeconds = 0;
+      if (parts.length === 2) totalSeconds = parts[0] * 60 + parts[1];
+      else if (parts.length === 3) totalSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+
+      if (totalSeconds <= 300 && freeButton.offsetParent !== null) {
+        try { freeButton.click(); } catch {}
+      }
+    });
+  }
+
   // ------------------ Loops de construção ------------------
   async function buildLoopOnce() {
+    // tenta finalizar grátis antes de emitir novas ordens
+    clickFreeFinishersInDOM();
+
     const orders = getOrders();
     if (!orders.length) return false;
 
@@ -184,6 +200,10 @@
       }
       await sleep(randInt(MIN_BUILD_DELAY_MS, MAX_BUILD_DELAY_MS));
     }
+
+    // tenta finalizar grátis novamente após emitir ordens
+    clickFreeFinishersInDOM();
+
     return true;
   }
 
@@ -218,7 +238,12 @@
         console.warn('[ConstructorGold] Não conseguiu detectar o grupo de cidades ainda.', e);
       }
 
+      // pequeno atraso extra
       await sleep(500);
+
+      // também roda o finalizador a cada 5s, independente do loop (resiliência)
+      setInterval(clickFreeFinishersInDOM, 5000);
+
       runLoop();
     } catch (e) {
       started = false;
@@ -234,6 +259,7 @@
     console.warn('[ConstructorGold] Falha ao assinar GameEvents:', e);
   }
 
+  // Inicializa mesmo se carregado depois do evento
   startOnce();
 
   // Debug helpers
