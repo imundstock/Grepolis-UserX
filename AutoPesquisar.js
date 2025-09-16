@@ -15,6 +15,52 @@
     }
     await sleep(3000);
 
+    /* ---------- HELPERS P/ JANELAS (corrigem wnd.getType is not a function) ---------- */
+
+    function getWndHandler(anyWnd) {
+        if (!anyWnd) return null;
+
+        // Já é um handler?
+        if (typeof anyWnd.getID === 'function') return anyWnd;
+
+        // Veio como { wnd: handler }
+        if (anyWnd.wnd && typeof anyWnd.wnd.getID === 'function') return anyWnd.wnd;
+
+        // Veio como id numérico
+        if (typeof anyWnd === 'number') return uw.GPWindowMgr?.getWindowById?.(anyWnd) || null;
+
+        // Veio como { id } ou { wnd_id } ou aninhado
+        const id = anyWnd.wnd_id ?? anyWnd.id ?? (anyWnd.wnd && anyWnd.wnd.id);
+        if (id != null) return uw.GPWindowMgr?.getWindowById?.(parseInt(id, 10)) || null;
+
+        return null;
+    }
+
+    function wndTypeOf(anyWnd) {
+        const wnd = getWndHandler(anyWnd);
+        if (!wnd) return null;
+        if (typeof wnd.getType === 'function') return wnd.getType();
+        try { return wnd.getHandler?.().getType?.() ?? null; } catch { return null; }
+    }
+
+    function getWindowByTypeSafe(type) {
+        // Tenta WM
+        try {
+            const list = uw.WM?.getWindowByType?.(type) || [];
+            if (Array.isArray(list) && list.length) return list[0];
+        } catch {}
+        // Fallback GPWindowMgr
+        try {
+            const all = uw.GPWindowMgr?.getOpenWindows?.() || [];
+            for (const w of all) {
+                if (wndTypeOf(w) === type) return getWndHandler(w);
+            }
+        } catch {}
+        return null;
+    }
+
+    /* ------------------------------------------------------------------------------- */
+
     function getConquestMode(research) {
         try {
             const css = uw.GameDataResearches.getResearchCssClass(research);
@@ -24,7 +70,7 @@
         }
     }
 
-    console.log("Grepolis Academy Planner v0.1.5 ativo.");
+    console.log("Grepolis Academy Planner v0.1.5 ativo (com patch de janela).");
 
     if (usedForMultiAccounting) {
         const predefinedResearches = [
@@ -62,18 +108,30 @@
         </style>
     `);
 
+    /* ------- OBSERVERS (usando normalização de janela) ------- */
+
     $.Observer(uw.GameEvents.game.load).subscribe("GAP_load", attachAjaxListener);
-    $.Observer(uw.GameEvents.window.open).subscribe("GAP_window_open", (e, wnd) => {
-        if (!wnd.cid) return;
-        if (wnd.getType() === "academy") {
+
+    $.Observer(uw.GameEvents.window.open).subscribe("GAP_window_open", (e, raw) => {
+        const wnd = getWndHandler(raw);
+        if (!wnd) return;
+
+        const hasCid = wnd.cid || typeof wnd.getIdentifier === 'function';
+        if (!hasCid) return;
+
+        if (wndTypeOf(wnd) === "academy") {
             currentAcademyWindow = wnd;
             openAcademy(wnd);
         }
     });
+
     $.Observer(uw.GameEvents.town.town_switch).subscribe("GAP_town_switch", resetAcademy);
 
-    $.Observer(uw.GameEvents.window.close).subscribe("GAP_window_close", (e, wnd) => {
-        if (wnd && wnd.getType() === "academy") {
+    $.Observer(uw.GameEvents.window.close).subscribe("GAP_window_close", (e, raw) => {
+        const wnd = getWndHandler(raw);
+        if (!wnd) return;
+
+        if (wndTypeOf(wnd) === "academy") {
             currentAcademyWindow = null;
             if (academyObserver) {
                 academyObserver.disconnect();
@@ -95,7 +153,7 @@
                 case "frontend_bridge/fetch":
                 case "notify/fetch":
                     if (fbType === "academy" || currentAcademyWindow) {
-                        const wnd = currentAcademyWindow || uw.WM.getWindowByType("academy")[0];
+                        const wnd = currentAcademyWindow || getWindowByTypeSafe("academy");
                         if (wnd) {
                             setTimeout(() => openAcademy(wnd), 100);
                         }
@@ -105,6 +163,7 @@
         });
     });
 
+    /* roda a cada 60s tentando pesquisar conforme lista salva por cidade */
     setInterval(() => {
         const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
 
@@ -120,10 +179,12 @@
 
     function attachAjaxListener() {
         $(document).ajaxComplete((e, xhr, opt) => {
-            const url = new URL("https://dummy/?" + opt.url.split("?")[1]);
+            const qs = opt.url.split("?")[1];
+            if (!qs) return;
+            const url = new URL("https://dummy/?" + qs);
             const action = opt.url.split("?")[0].substr(5);
             if (action === "frontend_bridge/fetch" && url.searchParams.get("window_type") === "academy") {
-                const wnd = uw.WM.getWindowByType("academy")[0];
+                const wnd = getWindowByTypeSafe("academy");
                 if (wnd) {
                     currentAcademyWindow = wnd;
                     setTimeout(() => openAcademy(wnd), 100);
@@ -229,7 +290,7 @@
 
         const { wood, stone, iron } = town.resources();
 
-        // Verificar se todas as propriedades necessárias existem
+        // Verificar requisitos
         if (!reqsTech.building_dependencies || !reqsTech.resources ||
             academy < reqsTech.building_dependencies.academy ||
             availablePoints < reqsTech.research_points ||
@@ -279,7 +340,9 @@
 
             techTree.find("div.research").each((_, el) => {
                 const $el = $(el);
-                const research = $el.attr("class").split(/\s+/)[2];
+                const classes = $el.attr("class").split(/\s+/);
+                // .research.<nome> ... normalmente a 2ª ou 3ª classe
+                const research = classes.find(c => c !== 'research' && !c.startsWith('type_')) || classes[2];
                 const isInactive = $el.hasClass("inactive");
 
                 $el.off("click.GAP").on("click.GAP", (e) => {
@@ -320,9 +383,9 @@
                         if (node.nodeType === 1) {
                             return node.matches && (
                                 node.matches('.tech_tree_box') ||
-                                node.querySelector && node.querySelector('.tech_tree_box') ||
+                                (node.querySelector && node.querySelector('.tech_tree_box')) ||
                                 node.matches('.research') ||
-                                node.querySelector && node.querySelector('.research')
+                                (node.querySelector && node.querySelector('.research'))
                             );
                         }
                         return false;
