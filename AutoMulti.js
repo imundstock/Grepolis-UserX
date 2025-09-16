@@ -11,7 +11,8 @@
         RELOAD_MAX_TIME: 4800,
         HERO_CHECK_DELAY: 15000,
         HERO_WINDOW_DELAY: 2500,
-        INITIALIZATION_DELAY: 10000
+        INITIALIZATION_DELAY: 10000,
+        TOWN_TO_HIDE: null
     };
 
     // Utilitários
@@ -32,12 +33,22 @@
             const min = CONFIG.RELOAD_MIN_TIME;
             const max = CONFIG.RELOAD_MAX_TIME;
             return (Math.floor(Math.random() * (max - min + 1)) + min) * 1000;
+        },
+
+        getConquestMode: () => {
+            try {
+                const css = uw.GameDataResearches.getResearchCssClass('take_over');
+                return css === 'take_over_old' ? 'cerco' : 'revolta';
+            } catch (e) {
+                return 'revolta'; // Padrão para revolta se não conseguir determinar
+            }
         }
     };
 
     const uw = Utils.getUnsafeWindow();
+    const gameMode = Utils.getConquestMode();
 
-    // Sistema de recompensas e missões (Progressable)
+    // Sistema de recompensas e missões
     const RewardSystem = {
         FAVOR_REWARDS: {
             1: { favor: 60 },
@@ -90,6 +101,7 @@
 
         processFinishedTasks: (town) => {
             const missions = RewardSystem.getFinishedTasks();
+            const { wood, iron, stone, storage } = town.resources();
 
             for (const mission of missions) {
                 for (const reward of mission.static_data.rewards) {
@@ -103,7 +115,6 @@
                         (type === "power" && ["population_boost", "coins_of_wisdom"].includes(power_id))) {
                         RewardSystem.claimReward(mission);
                         console.log("Recompensa reivindicada:", mission.progressable_id);
-                        // Mantém “uma por tick”, como o seu segundo script
                         return;
                     }
                 }
@@ -114,7 +125,6 @@
     // Sistema de login diário
     const DailyLoginSystem = {
         checkAndClaim: (favorAmount) => {
-            // Nota: getLevel() é Promise no backend; aqui mantemos como estava (uso leve)
             const expectedFavor = RewardSystem.FAVOR_REWARDS[DailyLoginSystem.getLevel()]?.favor;
 
             if (expectedFavor && expectedFavor + favorAmount < CONFIG.MAX_FAVOR) {
@@ -214,7 +224,108 @@
         }
     };
 
-    // Sistema de missões da ilha (corrigido)
+    // Sistema de construção
+    const BuildSystem = {
+        getBuildStages: () => {
+            console.log("Modo de jogo detectado:", gameMode);
+
+            if (gameMode === 'revolta') {
+                return [
+                        { lumber: 1, stoner: 1, ironer: 1, temple: 1, farm: 2 },
+                        { lumber: 2, storage: 2, main: 2, farm: 3, barracks: 1 },
+                        { stoner: 2, ironer: 2 },
+                        { lumber: 3, stoner: 3, ironer: 3, temple: 3 },
+                        { storage: 5, main: 5 },
+                        { market: 5 },
+                        { stoner: 7, lumber: 7, ironer: 7 },
+                        { academy: 7 },
+                        { main: 14, barracks: 5, farm: 11, storage: 13, academy: 13 },
+                        { stoner: 10, lumber: 15, ironer: 10 },
+                        { docks: 10 }
+                ];
+            } else if (gameMode === 'cerco') {
+                return [
+                        { lumber: 1, stoner: 1, ironer: 1, temple: 1, farm: 2 },
+                        { lumber: 2, storage: 2, main: 2, farm: 3, barracks: 1 },
+                        { stoner: 2, ironer: 2 },
+                        { lumber: 3, stoner: 3, ironer: 3, temple: 3 },
+                        { storage: 5, main: 5 },
+                        { market: 5 },
+                        { stoner: 7, lumber: 7, ironer: 7 },
+                        { academy: 7 },
+                        { main: 14, barracks: 5, farm: 11, storage: 13, academy: 13 },
+                        { stoner: 10, lumber: 15, ironer: 10 },
+                        { docks: 10 }
+                ];
+            }
+        },
+
+        initializeBuildSystem: () => {
+            uw.modernBot.autoBuild.towns_buildings = uw.modernBot.autoBuild.towns_buildings || {};
+            uw.modernBot.autoBuild.build_stage = uw.modernBot.autoBuild.build_stage || {};
+        },
+
+        determineStage: (currentBuildings) => {
+            let stage = 0;
+            const stages = BuildSystem.getBuildStages();
+
+            for (let i = 0; i < stages.length; i++) {
+                const stageRequirements = stages[i];
+                const isComplete = Object.entries(stageRequirements)
+                    .every(([building, level]) => currentBuildings[building] >= level);
+
+                if (isComplete) {
+                    stage = i + 1;
+                } else {
+                    break;
+                }
+            }
+
+            return stage;
+        },
+
+        updateBuildPlans: () => {
+            BuildSystem.initializeBuildSystem();
+            const stages = BuildSystem.getBuildStages();
+
+            for (const town of Object.values(uw.ITowns.towns)) {
+                const currentBuildings = town.buildings().attributes;
+                const stage = BuildSystem.determineStage(currentBuildings);
+
+                uw.modernBot.autoBuild.build_stage[town.id] = stage;
+
+                if (stage < stages.length) {
+                    const mergedPlan = { ...currentBuildings };
+                    const stageRequirements = stages[stage];
+
+                    for (const [building, level] of Object.entries(stageRequirements)) {
+                        if (!currentBuildings[building] || currentBuildings[building] < level) {
+                            mergedPlan[building] = level;
+                        }
+                    }
+
+                    uw.modernBot.autoBuild.towns_buildings[town.id] = mergedPlan;
+                } else {
+                    delete uw.modernBot.autoBuild.towns_buildings[town.id];
+                }
+
+                BuildSystem.handleAutoTroops(town);
+            }
+        },
+
+        handleAutoTroops: async (town) => {
+            const researches = town.researches().attributes;
+            const buildings = town.buildings().attributes;
+
+            const { research, building, level } = uw.modernBot.autoTrain.REQUIREMENTS['colonize_ship'];
+
+            if (research && researches[research] && building && buildings[building] >= level) {
+                uw.modernBot.autoTrain.editTroopCount(town.id, 'colonize_ship', 0);
+            }
+        }
+    };
+
+    // Sistema de missões da ilha
     const IslandQuestSystem = {
         initialize: () => {
             uw.modernBot.autoIslandQuests = uw.modernBot.autoIslandQuests || {
@@ -232,9 +343,11 @@
             }
         },
 
-        // ⚠️ Ajuste: considerar ativas apenas 'running' (evita travar por 'satisfied')
         getActiveQuestsCount: (quests) => {
-            return quests.filter(quest => quest.attributes?.state === 'running').length;
+            return quests.filter(quest => {
+                const state = quest.attributes?.state;
+                return state === 'running' || state === 'satisfied';
+            }).length;
         },
 
         canAcceptNewQuest: (quests) => {
@@ -250,7 +363,9 @@
             const townList = uw.MM.getOnlyCollectionByName('Town').models;
             const islandId = quest.attributes.dynamic_data?.island_id;
 
+            // Buscar a cidade diretamente no townList
             const town = townList.find(t => t.attributes.island_id === islandId);
+
             if (!town) {
                 console.error("Town not found on the island:", islandId);
                 return;
@@ -259,46 +374,35 @@
             if (town.attributes.id != uw.Game.townId) {
                 console.log("Trocando para a cidade:", town.attributes.id);
                 uw.HelperTown.townSwitch(town.attributes.id);
-                // ✅ Aguarda a troca de contexto aplicar
-                await Utils.sleep(400);
             }
         },
 
-        // ✅ Corrigido: usa uw.Game.townId; fallback de decision; espera virar 'running'
         acceptQuest: async (quest) => {
-            return new Promise((resolve) => {
-                const side = quest.attributes.static_data?.side ?? 'left';
-
+            return new Promise((myResolve, myReject) => {
                 const data = {
                     model_url: "IslandQuests",
                     action_name: "decide",
                     captcha: null,
                     arguments: {
-                        decision: side,
+                        decision: quest.attributes.static_data?.side,
                         progressable_name: quest.attributes.progressable_id
                     },
-                    town_id: uw.Game.townId,
+                    town_id: quest.attributes?.configuration?.town_id,
                     nl_init: true
                 };
 
                 console.log("Aceitando missão:", quest.attributes.progressable_id);
                 uw.gpAjax.ajaxPost("frontend_bridge", "execute", data, false, async () => {
-                    // Espera o estado virar 'running' para evitar race condition
-                    for (let i = 0; i < 10; i++) {
-                        const fresh = IslandQuestSystem.getQuests()
-                            .find(q => q.attributes.progressable_id === quest.attributes.progressable_id);
-                        if (fresh?.attributes?.state === 'running') break;
-                        await Utils.sleep(300);
-                    }
+                    console.log("Missão aceita:", quest.attributes.progressable_id);
+                    await Utils.sleep(100);
                     await IslandQuestSystem.challengeQuest(quest);
-                    resolve();
+                    myResolve();
                 });
             });
         },
 
-        // ✅ Corrigido: usa uw.Game.townId
         challengeQuest: async (quest) => {
-            return new Promise((resolve) => {
+            return new Promise((myResolve, myReject) => {
                 const data = {
                     model_url: "IslandQuests",
                     action_name: "challenge",
@@ -307,14 +411,14 @@
                         challenge: { current_town_id: true },
                         progressable_name: quest.attributes.progressable_id
                     },
-                    town_id: uw.Game.townId,
+                    town_id: quest.attributes?.configuration?.town_id,
                     nl_init: true
                 };
 
                 console.log("Desafiando missão:", quest.attributes.progressable_id);
                 uw.gpAjax.ajaxPost("frontend_bridge", "execute", data, false, () => {
                     console.log("Missão desafiada:", quest.attributes.progressable_id);
-                    resolve();
+                    myResolve()
                 });
             });
         },
@@ -329,7 +433,7 @@
                     state: "closed",
                     progressable_id: quest.attributes.progressable_id
                 },
-                town_id: uw.Game.townId,
+                town_id: quest.attributes?.configuration?.town_id,
                 nl_init: true
             };
 
@@ -347,7 +451,7 @@
                     return;
                 }
 
-                // 1) Primeiro, processar recompensas (pode deixar uma por ciclo, como no seu padrão)
+                // Primeiro, processar recompensas
                 for (const quest of quests) {
                     if (quest.attributes?.state === 'satisfied') {
                         console.log("Reivindicando recompensa:", quest.attributes.progressable_id);
@@ -355,7 +459,6 @@
                         try {
                             await IslandQuestSystem.setTownId(quest);
                             await IslandQuestSystem.claimQuestReward(quest);
-                            // mantém “uma por tick” para evitar flood
                             return;
                         } catch (error) {
                             console.error("Erro ao reivindicar recompensa:", error);
@@ -363,19 +466,19 @@
                     }
                 }
 
-                // 2) Verificar se podemos aceitar novas missões
+                // Verificar se podemos aceitar novas missões
                 if (!IslandQuestSystem.canAcceptNewQuest(quests)) {
                     console.log(`Limite de ${uw.modernBot.autoIslandQuests.maxActiveQuests} missões ativas atingido`);
                     return;
                 }
 
-                // 3) Aceitar qualquer viável (prioriza timer, mas não exige)
-                const viableQuests = quests.filter(q => q.attributes?.state === 'viable');
-                const timerQuest = viableQuests.find(IslandQuestSystem.isTimerQuest);
-                const quest = timerQuest || viableQuests[0];
+                // Processar missões viáveis
+                const viableQuests = quests.filter(quest => quest.attributes?.state === 'viable');
+                const timerQuests = viableQuests.filter(IslandQuestSystem.isTimerQuest);
 
-                if (quest) {
-                    console.log("Processando missão viável:", quest.attributes.progressable_id);
+                if (timerQuests.length > 0) {
+                    const quest = timerQuests[0];
+                    console.log("Processando missão de timer:", quest.attributes.progressable_id);
 
                     try {
                         await IslandQuestSystem.setTownId(quest);
@@ -384,7 +487,7 @@
                         console.error("Erro ao processar missão:", error);
                     }
                 } else {
-                    console.log("Nenhuma missão viável disponível");
+                    console.log("Nenhuma missão de timer disponível");
                 }
             } catch (error) {
                 console.error("Erro ao processar island quests:", error);
@@ -413,6 +516,31 @@
         }
     };
 
+    // Sistema de ocultação de navios colonizadores
+    const ColonizeShipHideSystem = {
+        main: async () => {
+            if (CONFIG.TOWN_TO_HIDE === 0) return;
+            const towns = Object.keys(uw.ITowns.towns);
+            for (let town_id of towns) {
+                if (town_id == CONFIG.TOWN_TO_HIDE) continue;
+                let town = uw.ITowns.towns[town_id];
+                let units = uw.ITowns.towns[town.id].units();
+                for (let [unit_name, unit_count] of Object.entries(units)) {
+                    if (unit_name === "colonize_ship" && unit_count > 0) {
+                        let data = {
+                            id: CONFIG.TOWN_TO_HIDE,
+                            type: 'support',
+                            town_id: town_id,
+                            colonize_ship: unit_count
+                        };
+                        await uw.gpAjax.ajaxPost('town_info', 'send_units', data);
+                        console.log(`Enviando ${unit_count} navios colonizadores de ${town_id} para ${CONFIG.TOWN_TO_HIDE}`);
+                    }
+                }
+            }
+        }
+    };
+
     // Sistema principal
     const BotSystem = {
         initialize: () => {
@@ -427,12 +555,12 @@
             if (Object.values(uw.ITowns.towns).length < 3) {
                 uw.modernBot.autoRuralLevel.setRuralLevel(3);
                 if (!uw.modernBot.storage.load('enable_autorural_level_active')) {
-                    uw.modernBot.autoRuralLevel.toggle();
+                    uw.modernBot.autoRuralLevel.toggle()
                 }
             } else {
                 uw.modernBot.autoRuralLevel.setRuralLevel(6);
                 if (!uw.modernBot.storage.load('enable_autorural_level_active')) {
-                    uw.modernBot.autoRuralLevel.toggle();
+                    uw.modernBot.autoRuralLevel.toggle()
                 }
             }
 
@@ -448,6 +576,7 @@
             const isOnlyTown = Object.keys(uw.ITowns.towns).length === 1;
 
             // Processar sistemas
+            BuildSystem.updateBuildPlans();
             GodsSystem.processGodActions(town, isOnlyTown);
             DailyLoginSystem.process();
             RewardSystem.processFinishedTasks(town);
@@ -471,6 +600,10 @@
         setInterval(BotSystem.run, CONFIG.MAIN_INTERVAL);
     }, CONFIG.INITIALIZATION_DELAY);
 
-    // (Sistema de ocultação de navios colonizadores REMOVIDO)
+    // Inicializar sistema de ocultação de navios colonizadores
+    setTimeout(() => {
+        ColonizeShipHideSystem.main();
+        setInterval(ColonizeShipHideSystem.main, Math.round((Math.random() * (180 - 120) + 120)) * 1000);
+    }, 10000);
 
 })();
