@@ -3,6 +3,9 @@
 
     let uw = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
 
+    const STOP_ON_QUEST_ID = 'CastPowerQuest';
+    let missionStopped = false;
+
     const get_finisched_tasks = () => {
         const { Progressable } = uw.MM.getCollections();
         const { models } = Progressable[0];
@@ -48,6 +51,8 @@
     };
 
     function main() {
+        if (missionStopped) return;
+
         const town = uw.ITowns.getCurrentTown();
         const { wood, iron, stone, storage } = town.resources();
         const margin = 50;
@@ -67,7 +72,17 @@
 
         const missions = get_finisched_tasks();
 
+        // Se a missão proibida estiver concluída, para o script
+        const forbiddenMission = missions.find(m => m.progressable_id === STOP_ON_QUEST_ID);
+        if (forbiddenMission) {
+            console.log("⚠️ Missão proibida detectada (CastPowerQuest). Parando o script sem aceitar.");
+            missionStopped = true;
+            return;
+        }
+
         for (let mission of missions) {
+            if (mission.progressable_id === STOP_ON_QUEST_ID) continue; // NUNCA aceitar a missão proibida
+
             let { rewards } = mission.static_data;
             for (let reward of rewards) {
                 let { type, data } = reward;
