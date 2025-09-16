@@ -103,6 +103,7 @@
                         (type === "power" && ["population_boost", "coins_of_wisdom"].includes(power_id))) {
                         RewardSystem.claimReward(mission);
                         console.log("Recompensa reivindicada:", mission.progressable_id);
+                        // Mantém “uma por tick”, como o seu segundo script
                         return;
                     }
                 }
@@ -113,6 +114,7 @@
     // Sistema de login diário
     const DailyLoginSystem = {
         checkAndClaim: (favorAmount) => {
+            // Nota: getLevel() é Promise no backend; aqui mantemos como estava (uso leve)
             const expectedFavor = RewardSystem.FAVOR_REWARDS[DailyLoginSystem.getLevel()]?.favor;
 
             if (expectedFavor && expectedFavor + favorAmount < CONFIG.MAX_FAVOR) {
@@ -212,7 +214,7 @@
         }
     };
 
-    // Sistema de missões da ilha
+    // Sistema de missões da ilha (corrigido)
     const IslandQuestSystem = {
         initialize: () => {
             uw.modernBot.autoIslandQuests = uw.modernBot.autoIslandQuests || {
@@ -230,11 +232,9 @@
             }
         },
 
+        // ⚠️ Ajuste: considerar ativas apenas 'running' (evita travar por 'satisfied')
         getActiveQuestsCount: (quests) => {
-            return quests.filter(quest => {
-                const state = quest.attributes?.state;
-                return state === 'running' || state === 'satisfied';
-            }).length;
+            return quests.filter(quest => quest.attributes?.state === 'running').length;
         },
 
         canAcceptNewQuest: (quests) => {
@@ -259,35 +259,46 @@
             if (town.attributes.id != uw.Game.townId) {
                 console.log("Trocando para a cidade:", town.attributes.id);
                 uw.HelperTown.townSwitch(town.attributes.id);
+                // ✅ Aguarda a troca de contexto aplicar
+                await Utils.sleep(400);
             }
         },
 
+        // ✅ Corrigido: usa uw.Game.townId; fallback de decision; espera virar 'running'
         acceptQuest: async (quest) => {
-            return new Promise((myResolve, myReject) => {
+            return new Promise((resolve) => {
+                const side = quest.attributes.static_data?.side ?? 'left';
+
                 const data = {
                     model_url: "IslandQuests",
                     action_name: "decide",
                     captcha: null,
                     arguments: {
-                        decision: quest.attributes.static_data?.side,
+                        decision: side,
                         progressable_name: quest.attributes.progressable_id
                     },
-                    town_id: quest.attributes?.configuration?.town_id,
+                    town_id: uw.Game.townId,
                     nl_init: true
                 };
 
                 console.log("Aceitando missão:", quest.attributes.progressable_id);
                 uw.gpAjax.ajaxPost("frontend_bridge", "execute", data, false, async () => {
-                    console.log("Missão aceita:", quest.attributes.progressable_id);
-                    await Utils.sleep(100);
+                    // Espera o estado virar 'running' para evitar race condition
+                    for (let i = 0; i < 10; i++) {
+                        const fresh = IslandQuestSystem.getQuests()
+                            .find(q => q.attributes.progressable_id === quest.attributes.progressable_id);
+                        if (fresh?.attributes?.state === 'running') break;
+                        await Utils.sleep(300);
+                    }
                     await IslandQuestSystem.challengeQuest(quest);
-                    myResolve();
+                    resolve();
                 });
             });
         },
 
+        // ✅ Corrigido: usa uw.Game.townId
         challengeQuest: async (quest) => {
-            return new Promise((myResolve, myReject) => {
+            return new Promise((resolve) => {
                 const data = {
                     model_url: "IslandQuests",
                     action_name: "challenge",
@@ -296,14 +307,14 @@
                         challenge: { current_town_id: true },
                         progressable_name: quest.attributes.progressable_id
                     },
-                    town_id: quest.attributes?.configuration?.town_id,
+                    town_id: uw.Game.townId,
                     nl_init: true
                 };
 
                 console.log("Desafiando missão:", quest.attributes.progressable_id);
                 uw.gpAjax.ajaxPost("frontend_bridge", "execute", data, false, () => {
                     console.log("Missão desafiada:", quest.attributes.progressable_id);
-                    myResolve()
+                    resolve();
                 });
             });
         },
@@ -318,7 +329,7 @@
                     state: "closed",
                     progressable_id: quest.attributes.progressable_id
                 },
-                town_id: quest.attributes?.configuration?.town_id,
+                town_id: uw.Game.townId,
                 nl_init: true
             };
 
@@ -336,7 +347,7 @@
                     return;
                 }
 
-                // Primeiro, processar recompensas
+                // 1) Primeiro, processar recompensas (pode deixar uma por ciclo, como no seu padrão)
                 for (const quest of quests) {
                     if (quest.attributes?.state === 'satisfied') {
                         console.log("Reivindicando recompensa:", quest.attributes.progressable_id);
@@ -344,6 +355,7 @@
                         try {
                             await IslandQuestSystem.setTownId(quest);
                             await IslandQuestSystem.claimQuestReward(quest);
+                            // mantém “uma por tick” para evitar flood
                             return;
                         } catch (error) {
                             console.error("Erro ao reivindicar recompensa:", error);
@@ -351,19 +363,19 @@
                     }
                 }
 
-                // Verificar se podemos aceitar novas missões
+                // 2) Verificar se podemos aceitar novas missões
                 if (!IslandQuestSystem.canAcceptNewQuest(quests)) {
                     console.log(`Limite de ${uw.modernBot.autoIslandQuests.maxActiveQuests} missões ativas atingido`);
                     return;
                 }
 
-                // Processar missões viáveis
-                const viableQuests = quests.filter(quest => quest.attributes?.state === 'viable');
-                const timerQuests = viableQuests.filter(IslandQuestSystem.isTimerQuest);
+                // 3) Aceitar qualquer viável (prioriza timer, mas não exige)
+                const viableQuests = quests.filter(q => q.attributes?.state === 'viable');
+                const timerQuest = viableQuests.find(IslandQuestSystem.isTimerQuest);
+                const quest = timerQuest || viableQuests[0];
 
-                if (timerQuests.length > 0) {
-                    const quest = timerQuests[0];
-                    console.log("Processando missão de timer:", quest.attributes.progressable_id);
+                if (quest) {
+                    console.log("Processando missão viável:", quest.attributes.progressable_id);
 
                     try {
                         await IslandQuestSystem.setTownId(quest);
@@ -372,7 +384,7 @@
                         console.error("Erro ao processar missão:", error);
                     }
                 } else {
-                    console.log("Nenhuma missão de timer disponível");
+                    console.log("Nenhuma missão viável disponível");
                 }
             } catch (error) {
                 console.error("Erro ao processar island quests:", error);
@@ -435,7 +447,7 @@
             const town = uw.ITowns.getCurrentTown();
             const isOnlyTown = Object.keys(uw.ITowns.towns).length === 1;
 
-            // Processar sistemas (AUTOBUILD REMOVIDO)
+            // Processar sistemas
             GodsSystem.processGodActions(town, isOnlyTown);
             DailyLoginSystem.process();
             RewardSystem.processFinishedTasks(town);
