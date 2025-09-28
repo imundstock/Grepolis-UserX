@@ -1,81 +1,139 @@
-(function () {
-    'use strict';
+// AutoDesbloquearAldeias.js
+// Adaptado para o BR79 ScriptHub (start/stop + ctx, sem diretivas de UserScript)
 
-    const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+export const manifest = {
+  version: '1.0.0',
+  niceName: 'Auto Desbloquear Aldeias (ilha atual)',
+  defaultSelected: true
+};
 
-    function unlock(polisID, farmTownPlayerID, ruralID, onDone) {
-        const data = {
-            model_url: 'FarmTownPlayerRelation/' + farmTownPlayerID,
-            action_name: 'unlock',
-            arguments: { farm_town_id: ruralID },
-            town_id: polisID
-        };
-        uw.gpAjax.ajaxPost('frontend_bridge', 'execute', data, () => {
-            console.log(`✅ Desbloqueada aldeia ${ruralID} (cidade ${polisID})`);
-            if (typeof onDone === 'function') onDone();
-        });
+let running = false;
+let _ctx = null;
+
+const CONFIG = {
+  targetStage: 2,      // alvo mínimo de expansão (1->2)
+  afterUnlockDelay: 500 // ms para dar tempo ao backend após o unlock
+};
+
+function log(...a){ _ctx?.log ? _ctx.log('[Aldeias]', ...a) : console.log('BR79p2 [Aldeias]', ...a); }
+function wait(ms){ return _ctx?.wait ? _ctx.wait(ms) : new Promise(r=>setTimeout(r, ms)); }
+function softStop(){ return !!(_ctx && _ctx.softStopFlag && _ctx.softStopFlag()); }
+
+async function waitForReady(timeoutMs=20000){
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs){
+    // objetos essenciais carregados?
+    if (window.Game?.townId &&
+        window.ITowns?.towns &&
+        window.MM?.getCollections?.() &&
+        window.MM.getCollections().FarmTown?.[0]?.models?.length >= 0 &&
+        window.MM.getCollections().FarmTownPlayerRelation?.[0]?.models?.length >= 0 &&
+        window.gpAjax) {
+      return true;
     }
+    if (softStop()) return false;
+    await wait(200);
+  }
+  return false;
+}
 
-    // upgrade padrão do ModernBot: sobe 1 estágio (1→2)
-    function upgrade(polisID, farmTownPlayerID, ruralID) {
-        const data = {
-            model_url: 'FarmTownPlayerRelation/' + farmTownPlayerID,
-            action_name: 'upgrade',
-            arguments: { farm_town_id: ruralID },
-            town_id: polisID
-        };
-        uw.gpAjax.ajaxPost('frontend_bridge', 'execute', data, () => {
-            console.log(`⬆️  Upgrade pedido para aldeia ${ruralID} → nível 2 (cidade ${polisID})`);
-        });
-    }
+function ajaxExecute(model_url, action_name, args, town_id){
+  return new Promise((resolve, reject)=>{
+    window.gpAjax.ajaxPost(
+      'frontend_bridge','execute',
+      { model_url, action_name, arguments: args, town_id },
+      ()=>resolve(true),
+      ()=>reject(new Error('ajaxPost error'))
+    );
+  });
+}
 
-    function desbloquearEAumentarAldeiasDaIlhaAtual() {
-        const polisID = uw.Game.townId;
-        const islandX = uw.ITowns.towns[polisID].getIslandCoordinateX();
-        const islandY = uw.ITowns.towns[polisID].getIslandCoordinateY();
+async function unlock(polisID, farmTownPlayerID, ruralID){
+  await ajaxExecute(`FarmTownPlayerRelation/${farmTownPlayerID}`, 'unlock', { farm_town_id: ruralID }, polisID);
+  log(`✅ Desbloqueada aldeia ${ruralID} (cidade ${polisID})`);
+}
 
-        const aldeias = uw.MM.getCollections().FarmTown[0].models;
-        const relacoes = uw.MM.getCollections().FarmTownPlayerRelation[0].models;
+async function upgrade(polisID, farmTownPlayerID, ruralID, target=CONFIG.targetStage){
+  await ajaxExecute(`FarmTownPlayerRelation/${farmTownPlayerID}`, 'upgrade', { farm_town_id: ruralID }, polisID);
+  log(`⬆️ Upgrade pedido para aldeia ${ruralID} → nível ${target} (cidade ${polisID})`);
+}
 
-        for (let i = 0; i < aldeias.length; i++) {
-            const aldeia = aldeias[i];
-            if (aldeia.attributes.island_x !== islandX || aldeia.attributes.island_y !== islandY) continue;
+async function processIslandForCurrentTown(){
+  const polisID = window.Game.townId;
+  const town = window.ITowns.towns[polisID];
+  const islandX = town.getIslandCoordinateX();
+  const islandY = town.getIslandCoordinateY();
 
-            const ruralID = aldeia.id;
+  const aldeias = window.MM.getCollections().FarmTown?.[0]?.models || [];
+  const relacoes = window.MM.getCollections().FarmTownPlayerRelation?.[0]?.models || [];
 
-            for (let j = 0; j < relacoes.length; j++) {
-                const rel = relacoes[j];
-                if (ruralID !== rel.getFarmTownId()) continue;
+  let actions = 0;
 
-                const farmTownPlayerID = rel.id;
+  for (let i=0; i<aldeias.length; i++){
+    if (softStop() || !running) break;
 
-                // 0 = bloqueada; desbloqueia e depois upa 1x (1->2)
-                if (rel.attributes.relation_status === 0) {
-                    unlock(polisID, farmTownPlayerID, ruralID, () => {
-                        // dá um respiro curto pro backend registrar o unlock
-                        setTimeout(() => upgrade(polisID, farmTownPlayerID, ruralID), 500);
-                    });
-                } else {
-                    // já desbloqueada: se ainda estiver no nível 1, tenta subir para 2
-                    const stage = rel.attributes.expansion_stage || 1; // fallback seguro
-                    if (stage < 2) {
-                        upgrade(polisID, farmTownPlayerID, ruralID);
-                    }
-                }
-            }
+    const aldeia = aldeias[i];
+    const ax = aldeia.attributes.island_x;
+    const ay = aldeia.attributes.island_y;
+    if (ax !== islandX || ay !== islandY) continue;
+
+    const ruralID = aldeia.id;
+
+    // encontrar a relação player<->aldeia correspondente
+    const rel = relacoes.find(r => r.getFarmTownId?.() === ruralID);
+    if (!rel) continue;
+
+    const farmTownPlayerID = rel.id;
+    const relationStatus = rel.attributes?.relation_status ?? 0; // 0 = bloqueada
+    const stage = rel.attributes?.expansion_stage ?? 1;
+
+    try{
+      if (relationStatus === 0){
+        await unlock(polisID, farmTownPlayerID, ruralID);
+        actions++;
+        if (softStop() || !running) break;
+
+        await wait(CONFIG.afterUnlockDelay);
+        if ((rel.attributes?.expansion_stage ?? 1) < CONFIG.targetStage){
+          await upgrade(polisID, farmTownPlayerID, ruralID, CONFIG.targetStage);
+          actions++;
         }
+      } else if (stage < CONFIG.targetStage){
+        await upgrade(polisID, farmTownPlayerID, ruralID, CONFIG.targetStage);
+        actions++;
+      }
+    }catch(err){
+      log('⚠️ Falha ao operar aldeia', ruralID, err?.message||err);
     }
 
-    const waitUntilReady = setInterval(() => {
-        if (
-            uw.Game?.townId &&
-            uw.ITowns?.towns &&
-            uw.MM?.getCollections()?.FarmTown?.[0]?.models?.length &&
-            uw.MM?.getCollections()?.FarmTownPlayerRelation?.[0]?.models?.length
-        ) {
-            clearInterval(waitUntilReady);
-            console.log("🚀 Desbloqueando e upando aldeias da ilha da cidade atual para o nível 2...");
-            desbloquearEAumentarAldeiasDaIlhaAtual();
-        }
-    }, 1000);
-})();
+    // respiro curto entre aldeias para não saturar
+    await wait(150);
+  }
+
+  log(`Concluído na ilha atual de "${town.name}" — ações executadas: ${actions}`);
+}
+
+export async function start(ctx){
+  if (running) return;
+  running = true;
+  _ctx = ctx || _ctx;
+
+  const ready = await waitForReady();
+  if (!ready){
+    log('Jogo não ficou pronto; abortando.');
+    running = false;
+    return;
+  }
+
+  try{
+    await processIslandForCurrentTown();
+  } finally {
+    running = false;
+    log('Finalizado.');
+  }
+}
+
+export function stop(){
+  // laço é curto e verifica running/softStop entre passos
+  running = false;
+}
