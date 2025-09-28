@@ -1,22 +1,42 @@
-(function() {
-    'use strict';
+// AutoApagarNotificacoes.js
+// Adaptado para o BR79 ScriptHub (start/stop + ctx)
 
-    // Função para clicar no botão "X" que apaga todas as notificações
-    function clicarNoX() {
-        const botaoFechar = document.querySelector("#delete_all_notifications");
+// Manifesto lido pelo Hub
+export const manifest = {
+  version: '1.6.0',
+  niceName: 'Auto Apagar Notificações',
+  defaultSelected: true
+};
 
-        if (botaoFechar) {
-            console.log("✅ Notificações encontradas! Clicando no 'X'...");
-            botaoFechar.click();
-        } else {
-            console.log("⚠ Nenhum botão de apagar notificações encontrado.");
-        }
-    }
+let running = false;
+let _ctx = null;
+let intervalId = null;
+let timeoutId = null;
 
-    // Executa a ação 10 segundos após carregar a página
-    setTimeout(clicarNoX, 30000);
+function log(...a){ _ctx?.log ? _ctx.log('[Notif]', ...a) : console.log('BR79p2 [Notif]', ...a); }
+function wait(ms){ return _ctx?.wait ? _ctx.wait(ms) : new Promise(r=>setTimeout(r,ms)); }
+function softStop(){ return !!(_ctx && _ctx.softStopFlag && _ctx.softStopFlag()); }
 
-    // Repete a ação automaticamente a cada 10 minutos (600.000 ms)
-    setInterval(clicarNoX, 400000);
+function clicarNoX(){
+  const botaoFechar = document.querySelector("#delete_all_notifications");
+  if (botaoFechar){
+    log("✅ Notificações encontradas! Clicando no 'X'...");
+    botaoFechar.click();
+  } else {
+    log("⚠ Nenhum botão de apagar notificações encontrado.");
+  }
+}
 
-})();
+export async function start(ctx){
+  if (running) return;
+  running = true;
+  _ctx = ctx || _ctx;
+
+  // primeira execução após ~30s
+  timeoutId = setTimeout(()=>{
+    if (running && !softStop()) clicarNoX();
+  }, 30000);
+
+  // depois a cada ~6min 40s (400000 ms)
+  intervalId = setInterval(()=>{
+    if (running && !softS
