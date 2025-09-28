@@ -1,449 +1,343 @@
-(async function () {
-    'use strict';
+// AcademyPlannerAutoResearch.js
+// Adaptado para o BR79 ScriptHub (start/stop + ctx, sem diretivas de UserScript)
 
-    const uw = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
-    const STORAGE_KEY = uw.Game.world_id + "_RESEARCHES";
-    let currentResearchIndex = 0;
-    let currentAcademyWindow = null;
-    let academyObserver = null;
-    let usedForMultiAccounting = true;
+export const manifest = {
+  version: '0.2.0',
+  niceName: 'Academy Planner (auto research)',
+  defaultSelected: true
+};
 
-    if (!uw.location.pathname.includes("game")) return;
+let running = false;
+let _ctx = null;
 
-    function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+// ===== Config =====
+const CONF = {
+  seedForMultiAccount: true,        // semeia lista padrão por cidade quando vazia
+  tickMs: 60000,                    // intervalo entre tentativas de pesquisa
+  cssId: 'gap-styles',              // id do <style> para remoção no stop()
+  ns: 'GAP',                        // namespace para observers jQuery
+  initialDelayMs: 3000
+};
+
+// ===== Helpers de contexto =====
+const wait = (ms)=> _ctx?.wait ? _ctx.wait(ms) : new Promise(r=>setTimeout(r,ms));
+const log  = (...a)=> _ctx?.log ? _ctx.log('[Academy]', ...a) : console.log('BR79p2 [Academy]', ...a);
+const softStop = ()=> !!(_ctx && _ctx.softStopFlag && _ctx.softStopFlag());
+
+// ===== Estado/recursos do script =====
+let currentResearchIndex = 0;
+let currentAcademyWindow = null;
+let academyObserver = null;
+
+// para facilitar unsubscribe/cleanup
+let boundAjaxComplete = null;
+let observersBound = false;
+
+// jQuery/unsafeWindow
+const uw = (typeof unsafeWindow === 'undefined' ? window : unsafeWindow);
+const $J = uw.jQuery || uw.$;
+
+// STORAGE por mundo
+const STORAGE_KEY = ()=> (uw.Game?.world_id || 'WORLD') + '_RESEARCHES';
+
+// ====== Utils de janela (patch seguro) ======
+function getWndHandler(anyWnd){
+  if (!anyWnd) return null;
+  if (typeof anyWnd.getID === 'function') return anyWnd;
+  if (anyWnd.wnd && typeof anyWnd.wnd.getID === 'function') return anyWnd.wnd;
+  if (typeof anyWnd === 'number') return uw.GPWindowMgr?.getWindowById?.(anyWnd) || null;
+  const id = anyWnd.wnd_id ?? anyWnd.id ?? (anyWnd.wnd && anyWnd.wnd.id);
+  if (id != null) return uw.GPWindowMgr?.getWindowById?.(parseInt(id,10)) || null;
+  return null;
+}
+function wndTypeOf(anyWnd){
+  const wnd = getWndHandler(anyWnd);
+  if (!wnd) return null;
+  if (typeof wnd.getType === 'function') return wnd.getType();
+  try { return wnd.getHandler?.().getType?.() ?? null; } catch { return null; }
+}
+function getWindowByTypeSafe(type){
+  try {
+    const list = uw.WM?.getWindowByType?.(type) || [];
+    if (Array.isArray(list) && list.length) return list[0];
+  } catch {}
+  try {
+    const all = uw.GPWindowMgr?.getOpenWindows?.() || [];
+    for (const w of all){ if (wndTypeOf(w) === type) return getWndHandler(w); }
+  } catch {}
+  return null;
+}
+
+// ====== Persistência ======
+function loadAll(){ try { return JSON.parse(localStorage.getItem(STORAGE_KEY()) || '{}'); } catch { return {}; } }
+function saveAll(obj){ localStorage.setItem(STORAGE_KEY(), JSON.stringify(obj||{})); }
+function loadResearches(townId){
+  const all = loadAll(); return all[townId] || [];
+}
+function saveResearches(townId, arr){
+  const all = loadAll(); all[townId] = arr; saveAll(all);
+}
+
+// ====== Seeding inicial por cidade (opcional) ======
+function seedDefaultPerTown(){
+  if (!CONF.seedForMultiAccount) return;
+  const defaults = [
+    'slinger','town_guard','booty_bpv','architecture','shipwright','building_crane',
+    'colonize_ship','pottery'
+  ];
+  const towns = uw.ITowns?.towns || {};
+  let updated = 0;
+  Object.keys(towns).forEach(id=>{
+    const all = loadAll();
+    const cur = all[id] || [];
+    if (cur.length === 0){ all[id] = [...defaults]; updated++; }
+    saveAll(all);
+  });
+  if (updated) log('seed aplicado em', updated, 'cidades');
+}
+
+// ====== Estilos ======
+function injectCss(){
+  if (document.getElementById(CONF.cssId)) return;
+  const style = document.createElement('style');
+  style.id = CONF.cssId;
+  style.textContent = `
+    .GAP_highlight_inactive::after {
+      content: '';
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(0, 255, 0, 0.5);
     }
-    await sleep(3000);
+    .GAP_highlight_active {
+      border: 1px solid rgba(0, 255, 0, 1);
+    }
+  `;
+  document.head.appendChild(style);
+}
+function removeCss(){
+  const el = document.getElementById(CONF.cssId);
+  if (el) el.remove();
+}
 
-    /* ---------- HELPERS P/ JANELAS (corrigem wnd.getType is not a function) ---------- */
+// ====== jQuery Observers / Ajax hooks ======
+function bindObservers(){
+  if (observersBound || !$J?.Observer) return;
+  observersBound = true;
 
-    function getWndHandler(anyWnd) {
-        if (!anyWnd) return null;
+  // game.load -> attach ajax listener
+  $J.Observer(uw.GameEvents.game.load).subscribe(`${CONF.ns}_load`, attachAjaxListener);
 
-        // Já é um handler?
-        if (typeof anyWnd.getID === 'function') return anyWnd;
+  // window open/close
+  $J.Observer(uw.GameEvents.window.open).subscribe(`${CONF.ns}_window_open`, (e, raw)=>{
+    const wnd = getWndHandler(raw); if (!wnd) return;
+    if (wndTypeOf(wnd) === 'academy'){
+      currentAcademyWindow = wnd;
+      openAcademy(wnd);
+    }
+  });
 
-        // Veio como { wnd: handler }
-        if (anyWnd.wnd && typeof anyWnd.wnd.getID === 'function') return anyWnd.wnd;
+  $J.Observer(uw.GameEvents.window.close).subscribe(`${CONF.ns}_window_close`, (e, raw)=>{
+    const wnd = getWndHandler(raw); if (!wnd) return;
+    if (wndTypeOf(wnd) === 'academy'){
+      currentAcademyWindow = null;
+      if (academyObserver){ academyObserver.disconnect(); academyObserver = null; }
+    }
+  });
 
-        // Veio como id numérico
-        if (typeof anyWnd === 'number') return uw.GPWindowMgr?.getWindowById?.(anyWnd) || null;
+  // troca de cidade -> re-render
+  $J.Observer(uw.GameEvents.town.town_switch).subscribe(`${CONF.ns}_town_switch`, resetAcademy);
 
-        // Veio como { id } ou { wnd_id } ou aninhado
-        const id = anyWnd.wnd_id ?? anyWnd.id ?? (anyWnd.wnd && anyWnd.wnd.id);
-        if (id != null) return uw.GPWindowMgr?.getWindowById?.(parseInt(id, 10)) || null;
+  // ajax global (para atualizações da janela academia)
+  const onAjaxComplete = function(e, xhr, opt){
+    try{
+      const url = opt?.url || '';
+      const [path, qs] = url.split('?');
+      const action = (path||'').substr(5);
+      if (!qs) return;
 
-        return null;
+      const params = new URLSearchParams(qs);
+      const fbType = params.get('window_type');
+
+      if ((action === 'frontend_bridge/fetch' || action === 'notify/fetch') &&
+          (fbType === 'academy' || currentAcademyWindow)){
+        const wnd = currentAcademyWindow || getWindowByTypeSafe('academy');
+        if (wnd) setTimeout(()=> openAcademy(wnd), 100);
+      }
+    }catch{}
+  };
+  boundAjaxComplete = onAjaxComplete;
+  $J(document).on('ajaxComplete', boundAjaxComplete);
+}
+
+function unbindObservers(){
+  if (!$J?.Observer) return;
+  $J.Observer(uw.GameEvents.game.load).unsubscribe(`${CONF.ns}_load`);
+  $J.Observer(uw.GameEvents.window.open).unsubscribe(`${CONF.ns}_window_open`);
+  $J.Observer(uw.GameEvents.window.close).unsubscribe(`${CONF.ns}_window_close`);
+  $J.Observer(uw.GameEvents.town.town_switch).unsubscribe(`${CONF.ns}_town_switch`);
+  observersBound = false;
+
+  if (boundAjaxComplete){ $J(document).off('ajaxComplete', boundAjaxComplete); boundAjaxComplete = null; }
+  if (academyObserver){ academyObserver.disconnect(); academyObserver = null; }
+}
+
+// ====== Lógica principal ======
+function getTownId(){ return uw.Game?.townId; }
+
+function toggleResearch(research, element, isInactive){
+  const tid = getTownId(); if (!tid) return;
+  const list = loadResearches(tid);
+  const idx = list.indexOf(research);
+
+  if (idx >= 0){
+    list.splice(idx,1);
+    removeClass(element);
+  }else{
+    list.push(research);
+    if (isInactive) addClassInactive(element); else addClassActive(element);
+    tryAutoResearch(research, tid);
+  }
+  saveResearches(tid, list);
+}
+
+function tryAutoResearch(research, townIdOverride = null){
+  const townId = townIdOverride || getTownId();
+  const town = uw.ITowns?.getTown?.(townId);
+  if (!town || !research) return;
+
+  let resKey = research;
+  if (resKey.endsWith('_old')) resKey = resKey.replace('_old','');
+  if (resKey.endsWith('_bpv')) resKey = resKey.replace('_bpv','');
+
+  const academyLvl = town.buildings()?.attributes?.academy;
+  if (!academyLvl) return;
+
+  const techs = town.researches()?.attributes || {};
+  const qa = uw.MM.getFirstTownAgnosticCollectionByName('ResearchOrder');
+  const queue = qa?.fragments?.[townId]?.models || [];
+  const queueLimit = uw.GameDataPremium?.isAdvisorActivated?.('curator') ? 7 : 2;
+
+  // já pesquisado ou na fila?
+  if (techs[resKey]) {
+    // remover dos salvos e tirar highlight
+    const list = loadResearches(townId);
+    const idx = list.indexOf(resKey);
+    if (idx >= 0){ list.splice(idx,1); saveResearches(townId, list); }
+    if (currentAcademyWindow){
+      const sel = '#window_'+currentAcademyWindow.getIdentifier();
+      const el = (uw.$)(sel).find(`.research.${resKey}`)[0];
+      if (el) removeClass(el);
+    }
+    return;
+  }
+  if (queue.length >= queueLimit) return;
+  if (queue.some(m => m?.attributes?.research_type === resKey)) return;
+
+  const reqsTech = uw.GameData?.researches?.[resKey];
+  if (!reqsTech){
+    // não existe mais -> remover
+    const list = loadResearches(townId);
+    const idx = list.indexOf(resKey);
+    if (idx >= 0){ list.splice(idx,1); saveResearches(townId, list); }
+    log(`Pesquisa "${resKey}" inexistente no GameData — removida da lista.`);
+    return;
+  }
+
+  // pontos de pesquisa disponíveis
+  const perLevel = uw.GameDataResearches?.getResearchPointsPerAcademyLevel?.() || 0;
+  let available = (town.getBuildings().getBuildingLevel('academy')|0) * perLevel;
+  Object.keys(uw.GameData.researches||{}).forEach(k=>{
+    if (town.getResearches().get(k)) available -= uw.GameData.researches[k].research_points;
+  });
+  available = Math.max(0, available);
+
+  const {wood,stone,iron} = town.resources();
+
+  // requisitos
+  if (!reqsTech.building_dependencies || !reqsTech.resources) return;
+  if ((academyLvl|0) < (reqsTech.building_dependencies.academy|0)) return;
+  if (available < (reqsTech.research_points|0)) return;
+  if (wood < reqsTech.resources.wood || stone < reqsTech.resources.stone || iron < reqsTech.resources.iron) return;
+
+  const data = {
+    model_url: 'ResearchOrder',
+    action_name: 'research',
+    captcha: null,
+    arguments: { id: resKey },
+    town_id: townId,
+    nl_init: true
+  };
+
+  uw.gpAjax.ajaxPost('frontend_bridge','execute', data, false, (resp)=>{
+    if (resp && typeof resp.success === 'string' && resp.success.includes('começou')){
+      const list = loadResearches(townId);
+      const idx = list.indexOf(resKey);
+      if (idx >= 0){ list.splice(idx,1); saveResearches(townId, list); }
+      log('Pesquisa iniciada:', resKey, 'na cidade', townId);
+    }
+  });
+}
+
+// Render da Academia com destaques + clique para toggle
+function openAcademy(wnd){
+  const selector = '#window_'+wnd.getIdentifier();
+  let retries = 0;
+
+  function tryRender(){
+    const $techTree = $J(selector).find('.tech_tree_box');
+    if ($techTree.length === 0){
+      if (retries++ < 15) return setTimeout(tryRender, 200);
+      return;
     }
 
-    function wndTypeOf(anyWnd) {
-        const wnd = getWndHandler(anyWnd);
-        if (!wnd) return null;
-        if (typeof wnd.getType === 'function') return wnd.getType();
-        try { return wnd.getHandler?.().getType?.() ?? null; } catch { return null; }
-    }
+    const tid = getTownId();
+    const saved = tid ? loadResearches(tid) : [];
 
-    function getWindowByTypeSafe(type) {
-        // Tenta WM
-        try {
-            const list = uw.WM?.getWindowByType?.(type) || [];
-            if (Array.isArray(list) && list.length) return list[0];
-        } catch {}
-        // Fallback GPWindowMgr
-        try {
-            const all = uw.GPWindowMgr?.getOpenWindows?.() || [];
-            for (const w of all) {
-                if (wndTypeOf(w) === type) return getWndHandler(w);
-            }
-        } catch {}
-        return null;
-    }
+    // limpa marcas
+    $techTree.find('div.research').each((_, el)=> removeClass(el));
 
-    /* ------------------------------------------------------------------------------- */
+    $techTree.find('div.research').each((_, el)=>{
+      const $el = $J(el);
+      const classes = ($el.attr('class')||'').split(/\s+/);
+      const research = classes.find(c => c !== 'research' && !c.startsWith('type_')) || classes[2];
+      const isInactive = $el.hasClass('inactive');
 
-    function getConquestMode(research) {
-        try {
-            const css = uw.GameDataResearches.getResearchCssClass(research);
-            return css === 'take_over_old' ? 'cerco' : 'revolta';
-        } catch (e) {
-            return 'desconhecido';
-        }
-    }
+      $el.off('click.GAP').on('click.GAP', (e)=>{
+        e.preventDefault(); e.stopPropagation();
+        toggleResearch(research, el, isInactive);
+      });
 
-    console.log("Grepolis Academy Planner v0.1.5 ativo (com patch de janela).");
-
-    if (usedForMultiAccounting) {
-        const predefinedResearches = [
-            "slinger", "town_guard", "booty_bpv", "architecture", "shipwright", "building_crane",
-            "colonize_ship", "pottery",
-        ];
-
-        const allTowns = uw.ITowns.towns;
-        let citiesUpdated = 0;
-
-        $.each(allTowns, function (id, town) {
-            const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-            const existingResearches = all[id] || [];
-
-            if (existingResearches.length === 0) {
-                all[id] = [...predefinedResearches];
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
-                citiesUpdated++;
-            }
-        });
-    }
-
-    $("head").append(`
-        <style>
-            .GAP_highlight_inactive::after {
-                content: '';
-                position: absolute;
-                width: 100%;
-                height: 100%;
-                background-color: rgba(0, 255, 0, 0.5);
-            }
-            .GAP_highlight_active {
-                border: 1px solid rgba(0, 255, 0, 1);
-            }
-        </style>
-    `);
-
-    /* ------- OBSERVERS (usando normalização de janela) ------- */
-
-    $.Observer(uw.GameEvents.game.load).subscribe("GAP_load", attachAjaxListener);
-
-    $.Observer(uw.GameEvents.window.open).subscribe("GAP_window_open", (e, raw) => {
-        const wnd = getWndHandler(raw);
-        if (!wnd) return;
-
-        const hasCid = wnd.cid || typeof wnd.getIdentifier === 'function';
-        if (!hasCid) return;
-
-        if (wndTypeOf(wnd) === "academy") {
-            currentAcademyWindow = wnd;
-            openAcademy(wnd);
-        }
+      if (saved.includes(research)){
+        if (isInactive) addClassInactive(el); else addClassActive(el);
+      }
     });
 
-    $.Observer(uw.GameEvents.town.town_switch).subscribe("GAP_town_switch", resetAcademy);
+    setupAcademyObserver(selector);
+  }
 
-    $.Observer(uw.GameEvents.window.close).subscribe("GAP_window_close", (e, raw) => {
-        const wnd = getWndHandler(raw);
-        if (!wnd) return;
+  tryRender();
+}
 
-        if (wndTypeOf(wnd) === "academy") {
-            currentAcademyWindow = null;
-            if (academyObserver) {
-                academyObserver.disconnect();
-                academyObserver = null;
-            }
-        }
-    });
+function setupAcademyObserver(selector){
+  if (academyObserver) academyObserver.disconnect();
 
-    $.Observer(uw.GameEvents.game.load).subscribe("GAP_ajax_listener", function () {
-        $(document).ajaxComplete(function (e, xhr, opt) {
-            let urlParts = opt.url.split("?");
-            let action = urlParts[0].substr(5);
-            if (!urlParts[1]) return;
+  const node = $J(selector)[0];
+  if (!node) return;
 
-            const params = new URLSearchParams(urlParts[1]);
-            const fbType = params.get("window_type");
+  academyObserver = new MutationObserver((mutations)=>{
+    let shouldReapply = false;
 
-            switch (action) {
-                case "frontend_bridge/fetch":
-                case "notify/fetch":
-                    if (fbType === "academy" || currentAcademyWindow) {
-                        const wnd = currentAcademyWindow || getWindowByTypeSafe("academy");
-                        if (wnd) {
-                            setTimeout(() => openAcademy(wnd), 100);
-                        }
-                    }
-                    break;
-            }
+    for (const m of mutations){
+      if (m.type === 'childList'){
+        const nodes = [...m.addedNodes, ...m.removedNodes];
+        const changed = nodes.some(n=>{
+          if (n.nodeType !== 1) return false;
+          return (n.matches && (n.matches('.tech_tree_box') || n.matches('.research')))
+              || (n.querySelector && (n.querySelector('.tech_tree_box') || n.querySelector('.research')));
         });
-    });
-
-    /* roda a cada 60s tentando pesquisar conforme lista salva por cidade */
-    setInterval(() => {
-        const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-
-        for (const [townId, researches] of Object.entries(all)) {
-            if (!Array.isArray(researches) || researches.length === 0) continue;
-            const index = currentResearchIndex % researches.length;
-            const research = researches[index];
-            tryAutoResearch(research, parseInt(townId));
-        }
-
-        currentResearchIndex++;
-    }, 60000);
-
-    function attachAjaxListener() {
-        $(document).ajaxComplete((e, xhr, opt) => {
-            const qs = opt.url.split("?")[1];
-            if (!qs) return;
-            const url = new URL("https://dummy/?" + qs);
-            const action = opt.url.split("?")[0].substr(5);
-            if (action === "frontend_bridge/fetch" && url.searchParams.get("window_type") === "academy") {
-                const wnd = getWindowByTypeSafe("academy");
-                if (wnd) {
-                    currentAcademyWindow = wnd;
-                    setTimeout(() => openAcademy(wnd), 100);
-                }
-            }
-        });
-    }
-
-    function getTownId() {
-        return uw.Game.townId;
-    }
-
-    function loadResearches() {
-        const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-        return all[getTownId()] || [];
-    }
-
-    function saveResearches(researches) {
-        const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-        all[getTownId()] = researches;
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
-    }
-
-    function toggleResearch(research, element, isInactive) {
-        let researches = loadResearches();
-        const index = researches.indexOf(research);
-
-        if (index >= 0) {
-            researches.splice(index, 1);
-            removeClass(element);
-        } else {
-            researches.push(research);
-            if (isInactive) addClassInactive(element);
-            else addClassActive(element);
-            tryAutoResearch(research);
-        }
-
-        saveResearches(researches);
-    }
-
-    function tryAutoResearch(research, townOverride = null) {
-        const townId = townOverride || getTownId();
-        const town = uw.ITowns.getTown(townId);
-        const academy = town.buildings().attributes.academy;
-        if (!academy || !research) return;
-
-        const techs = town.researches().attributes;
-        const researchesQueue = uw.MM.getFirstTownAgnosticCollectionByName("ResearchOrder")?.fragments[townId]?.models || [];
-        const queueLimit = uw.GameDataPremium.isAdvisorActivated('curator') ? 7 : 2;
-        const researchesQueueCount = researchesQueue.length;
-
-        const isAlreadyQueued = researchesQueue.some(model => model.attributes.research_type === research);
-        if (isAlreadyQueued) return;
-
-        if (researchesQueueCount >= queueLimit) return;
-
-        if (research.endsWith("_old")) {
-            research = research.replace("_old", "");
-        }
-        if (research.endsWith("_bpv")) {
-            research = research.replace("_bpv", "");
-        }
-
-        if (techs[research]) {
-            let researches = loadResearches();
-            const index = researches.indexOf(research);
-            if (index >= 0) {
-                researches.splice(index, 1);
-                saveResearches(researches);
-                if (currentAcademyWindow) {
-                    const selector = "#window_" + currentAcademyWindow.getIdentifier();
-                    const researchElement = $(selector).find(`.research.${research}`)[0];
-                    if (researchElement) {
-                        removeClass(researchElement);
-                    }
-                }
-            }
-            return;
-        }
-
-        const reqsTech = uw.GameData.researches[research];
-
-        // Verificar se a pesquisa existe no GameData
-        if (!reqsTech) {
-            console.warn(`Pesquisa "${research}" não encontrada no GameData. Removendo da lista.`);
-            let researches = loadResearches();
-            const index = researches.indexOf(research);
-            if (index >= 0) {
-                researches.splice(index, 1);
-                saveResearches(researches);
-            }
-            return;
-        }
-
-        let availablePoints = uw.ITowns.getCurrentTown().getBuildings().getBuildingLevel('academy') * GameDataResearches.getResearchPointsPerAcademyLevel();
-        $.each(uw.GameData.researches, function (ind) {
-            if (uw.ITowns.getCurrentTown().getResearches().get(ind)) {
-                availablePoints -= uw.GameData.researches[ind].research_points;
-            }
-        });
-
-        availablePoints = Math.max(0, availablePoints);
-
-        const { wood, stone, iron } = town.resources();
-
-        // Verificar requisitos
-        if (!reqsTech.building_dependencies || !reqsTech.resources ||
-            academy < reqsTech.building_dependencies.academy ||
-            availablePoints < reqsTech.research_points ||
-            wood < reqsTech.resources.wood ||
-            stone < reqsTech.resources.stone ||
-            iron < reqsTech.resources.iron) {
-            return;
-        }
-
-        const data = {
-            model_url: "ResearchOrder",
-            action_name: "research",
-            captcha: null,
-            arguments: { id: research },
-            town_id: townId,
-            nl_init: true
-        };
-
-        uw.gpAjax.ajaxPost("frontend_bridge", "execute", data, false, (resp) => {
-            if (resp && typeof resp.success === 'string' && resp.success.includes("começou")) {
-                let researches = loadResearches();
-                const index = researches.indexOf(research);
-                if (index >= 0) {
-                    researches.splice(index, 1);
-                    saveResearches(researches);
-                }
-            }
-        });
-    }
-
-    function openAcademy(wnd) {
-        const selector = "#window_" + wnd.getIdentifier();
-        let retries = 0;
-
-        function tryRender() {
-            const techTree = $(selector).find(".tech_tree_box");
-            if (techTree.length === 0) {
-                if (retries++ < 15) return setTimeout(tryRender, 200);
-                return;
-            }
-
-            const saved = loadResearches();
-
-            techTree.find("div.research").each((_, el) => {
-                removeClass(el);
-            });
-
-            techTree.find("div.research").each((_, el) => {
-                const $el = $(el);
-                const classes = $el.attr("class").split(/\s+/);
-                // .research.<nome> ... normalmente a 2ª ou 3ª classe
-                const research = classes.find(c => c !== 'research' && !c.startsWith('type_')) || classes[2];
-                const isInactive = $el.hasClass("inactive");
-
-                $el.off("click.GAP").on("click.GAP", (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    toggleResearch(research, el, isInactive);
-                });
-
-                if (saved.includes(research)) {
-                    if (isInactive) addClassInactive(el);
-                    else addClassActive(el);
-                }
-            });
-
-            setupAcademyObserver(selector);
-        }
-
-        tryRender();
-    }
-
-    function setupAcademyObserver(selector) {
-        if (academyObserver) {
-            academyObserver.disconnect();
-        }
-
-        const windowElement = $(selector)[0];
-        if (!windowElement) return;
-
-        academyObserver = new MutationObserver((mutations) => {
-            let shouldReapply = false;
-
-            mutations.forEach((mutation) => {
-                if (mutation.type === 'childList') {
-                    const addedNodes = Array.from(mutation.addedNodes);
-                    const removedNodes = Array.from(mutation.removedNodes);
-
-                    const techTreeChanged = [...addedNodes, ...removedNodes].some(node => {
-                        if (node.nodeType === 1) {
-                            return node.matches && (
-                                node.matches('.tech_tree_box') ||
-                                (node.querySelector && node.querySelector('.tech_tree_box')) ||
-                                node.matches('.research') ||
-                                (node.querySelector && node.querySelector('.research'))
-                            );
-                        }
-                        return false;
-                    });
-
-                    if (techTreeChanged) {
-                        shouldReapply = true;
-                    }
-                }
-
-                if (mutation.type === 'attributes' && mutation.attributeName === 'class') {
-                    const target = mutation.target;
-                    if (target.matches && (
-                        target.matches('.tab_research') ||
-                        target.matches('.tab_research_queue') ||
-                        target.classList.contains('active')
-                    )) {
-                        shouldReapply = true;
-                    }
-                }
-            });
-
-            if (shouldReapply && currentAcademyWindow) {
-                setTimeout(() => {
-                    if (currentAcademyWindow && $(selector).length > 0) {
-                        openAcademy(currentAcademyWindow);
-                    }
-                }, 150);
-            }
-        });
-
-        academyObserver.observe(windowElement, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class']
-        });
-    }
-
-    function resetAcademy() {
-        if (currentAcademyWindow) {
-            const selector = "#window_" + currentAcademyWindow.getIdentifier();
-            $(selector).find(".tech_tree_box .research").each((_, el) => {
-                removeClass(el);
-            });
-            setTimeout(() => openAcademy(currentAcademyWindow), 100);
-        }
-    }
-
-    function addClassInactive(el) {
-        $(el).addClass("GAP_highlight_inactive");
-    }
-
-    function addClassActive(el) {
-        $(el).addClass("GAP_highlight_active");
-    }
-
-    function removeClass(el) {
-        $(el).removeClass("GAP_highlight_inactive GAP_highlight_active");
-    }
-})();
+        if (changed) shouldReapply = true;
+      }
+      if (m.type === 'attributes' && m.attributeName === 'class'){
+        const t = m.target;
+        if (t.matches && (t.matches('.t
