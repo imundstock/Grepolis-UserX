@@ -83,7 +83,7 @@ function seedDefaultPerTown(){
   if (!CONF.seedForMultiAccount) return;
   const defaults = [
     'slinger','town_guard','booty_bpv','architecture','shipwright','building_crane',
-    'colonize_ship','pottery'
+    'colonize_ship','pottery','bireme'
   ];
   const towns = uw.ITowns?.towns || {};
   let updated = 0;
